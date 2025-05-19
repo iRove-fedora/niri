@@ -1,3 +1,0 @@
-# niri
-
-The niri package
