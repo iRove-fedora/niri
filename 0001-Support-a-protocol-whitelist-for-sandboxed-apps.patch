@@ -1,17 +1,17 @@
-From 43d5060269079e89be2a5505180354c6cbf253d3 Mon Sep 17 00:00:00 2001
+From f9af22877f362348018bcb69cbe5264cb0142319 Mon Sep 17 00:00:00 2001
 From: iRove-fedora <irove.fedora@outlook.com>
 Date: Sun, 14 Dec 2025 05:12:44 -0600
 Subject: [PATCH] Support a protocol whitelist for sandboxed apps
 
 ---
  .gitignore                         |  1 +
- niri-config/src/lib.rs             |  5 +++
+ niri-config/src/lib.rs             |  6 ++++
  niri-config/src/sandbox_rule.rs    | 31 +++++++++++++++++++
  src/dbus/mutter_service_channel.rs |  1 +
  src/handlers/mod.rs                | 36 ++++++++++++++++++++++
  src/niri.rs                        | 49 ++++++++++++++++++++++--------
  src/tests/fixture.rs               |  1 +
- 7 files changed, 111 insertions(+), 13 deletions(-)
+ 7 files changed, 112 insertions(+), 13 deletions(-)
  create mode 100644 niri-config/src/sandbox_rule.rs
 
 diff --git a/.gitignore b/.gitignore
@@ -23,7 +23,7 @@ index d787b706..7a2b5a41 100644
 +/vendor
  /result
 diff --git a/niri-config/src/lib.rs b/niri-config/src/lib.rs
-index 28e54e6b..caa0ab44 100644
+index 28e54e6b..db412ed0 100644
 --- a/niri-config/src/lib.rs
 +++ b/niri-config/src/lib.rs
 @@ -36,6 +36,7 @@ pub mod error;
@@ -66,6 +66,14 @@ index 28e54e6b..caa0ab44 100644
  
                  // Single-part sections.
                  "binds" => {
+@@ -2272,6 +2277,7 @@ mod tests {
+                     },
+                 ],
+             },
++            sandbox_rules: [],
+         }
+         "#);
+     }
 diff --git a/niri-config/src/sandbox_rule.rs b/niri-config/src/sandbox_rule.rs
 new file mode 100644
 index 00000000..2094145a
