@@ -1,0 +1,332 @@
+From 43d5060269079e89be2a5505180354c6cbf253d3 Mon Sep 17 00:00:00 2001
+From: iRove-fedora <irove.fedora@outlook.com>
+Date: Sun, 14 Dec 2025 05:12:44 -0600
+Subject: [PATCH] Support a protocol whitelist for sandboxed apps
+
+---
+ .gitignore                         |  1 +
+ niri-config/src/lib.rs             |  5 +++
+ niri-config/src/sandbox_rule.rs    | 31 +++++++++++++++++++
+ src/dbus/mutter_service_channel.rs |  1 +
+ src/handlers/mod.rs                | 36 ++++++++++++++++++++++
+ src/niri.rs                        | 49 ++++++++++++++++++++++--------
+ src/tests/fixture.rs               |  1 +
+ 7 files changed, 111 insertions(+), 13 deletions(-)
+ create mode 100644 niri-config/src/sandbox_rule.rs
+
+diff --git a/.gitignore b/.gitignore
+index d787b706..7a2b5a41 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,2 +1,3 @@
+ /target
++/vendor
+ /result
+diff --git a/niri-config/src/lib.rs b/niri-config/src/lib.rs
+index 28e54e6b..caa0ab44 100644
+--- a/niri-config/src/lib.rs
++++ b/niri-config/src/lib.rs
+@@ -36,6 +36,7 @@ pub mod error;
+ pub mod gestures;
+ pub mod input;
+ pub mod layer_rule;
++pub mod sandbox_rule;
+ pub mod layout;
+ pub mod misc;
+ pub mod output;
+@@ -52,6 +53,7 @@ pub use crate::error::{ConfigIncludeError, ConfigParseResult};
+ pub use crate::gestures::Gestures;
+ pub use crate::input::{Input, ModKey, ScrollMethod, TrackLayout, WarpMouseToFocusMode, Xkb};
+ pub use crate::layer_rule::LayerRule;
++pub use crate::sandbox_rule::{SandboxRule, PrivilegedProtocol};
+ pub use crate::layout::*;
+ pub use crate::misc::*;
+ pub use crate::output::{Output, OutputName, Outputs, Position, Vrr};
+@@ -89,6 +91,7 @@ pub struct Config {
+     pub debug: Debug,
+     pub workspaces: Vec<Workspace>,
+     pub recent_windows: RecentWindows,
++    pub sandbox_rules: Vec<SandboxRule>
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -163,6 +166,7 @@ where
+                     | "layer-rule"
+                     | "workspace"
+                     | "include"
++                    | "sandbox-rule"
+             ) && !seen.insert(name)
+             {
+                 ctx.emit_error(DecodeError::unexpected(
+@@ -210,6 +214,7 @@ where
+                 "window-rule" => m_push!(window_rules),
+                 "layer-rule" => m_push!(layer_rules),
+                 "workspace" => m_push!(workspaces),
++                "sandbox-rule" => m_push!(sandbox_rules),
+ 
+                 // Single-part sections.
+                 "binds" => {
+diff --git a/niri-config/src/sandbox_rule.rs b/niri-config/src/sandbox_rule.rs
+new file mode 100644
+index 00000000..2094145a
+--- /dev/null
++++ b/niri-config/src/sandbox_rule.rs
+@@ -0,0 +1,31 @@
++use crate::utils::RegexEq;
++
++#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
++pub struct SandboxRule {
++    #[knuffel(children(name = "match"))]
++    pub matches: Vec<Match>,
++
++    #[knuffel(child, unwrap(arguments))]
++    pub privileged_protocol_allowlist: Option<Vec<PrivilegedProtocol>>
++}
++
++#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
++pub struct Match {
++    #[knuffel(property, str)]
++    pub app_id: Option<RegexEq>
++}
++
++#[derive(knuffel::DecodeScalar, Debug, Clone, Copy, PartialEq, Eq)]
++pub enum PrivilegedProtocol {
++    LayerShell,
++    SessionLock,
++    InputMethod,
++    VirtualKeyboard,
++    VirtualPointer,
++    ForeignToplevelManagement,
++    Workspace,
++    OutputManagement,
++    Screencopy,
++    ExtDataControl,
++    WlrDataControl
++}
+diff --git a/src/dbus/mutter_service_channel.rs b/src/dbus/mutter_service_channel.rs
+index e226acb1..26f65a16 100644
+--- a/src/dbus/mutter_service_channel.rs
++++ b/src/dbus/mutter_service_channel.rs
+@@ -27,6 +27,7 @@ impl ServiceChannel {
+             restricted: false,
+             // FIXME: maybe you can get the PID from D-Bus somehow?
+             credentials_unknown: true,
++            privileged_protocol_allowlist: None
+         };
+         if let Err(err) = self.to_niri.send(client) {
+             warn!("error sending message to niri: {err:?}");
+diff --git a/src/handlers/mod.rs b/src/handlers/mod.rs
+index 73575b45..94311a50 100644
+--- a/src/handlers/mod.rs
++++ b/src/handlers/mod.rs
+@@ -471,6 +471,28 @@ pub fn configure_lock_surface(surface: &LockSurface, output: &Output) {
+ 
+ impl SecurityContextHandler for State {
+     fn context_created(&mut self, source: SecurityContextListenerSource, context: SecurityContext) {
++        let config = self.niri.config.borrow();
++        let sandbox_rules = &config.sandbox_rules;
++        let mut protocol_allowlist = None;
++
++        for rule in sandbox_rules {
++            let matches = |m| {
++                context_matches(&context, m)
++            };
++
++            // Skip rule if there are no matches
++            if !(rule.matches.is_empty() || rule.matches.iter().any(matches)) {
++                info!("skipping rule for {:?}", &context.app_id);
++                continue;
++            }
++
++            // We have a match, so set restricted protocols
++            if let Some(x) = &rule.privileged_protocol_allowlist {
++                protocol_allowlist = Some(x.clone()); 
++                info!("Adding {:?} to protocol allowlist for {:?}", &protocol_allowlist, &context.app_id);
++            }
++        }
++
+         self.niri
+             .event_loop
+             .insert_source(source, move |client, _, state| {
+@@ -479,11 +501,25 @@ impl SecurityContextHandler for State {
+                     client,
+                     restricted: true,
+                     credentials_unknown: false,
++                    privileged_protocol_allowlist: protocol_allowlist.clone(),
+                 });
+             })
+             .unwrap();
+     }
++
+ }
++
++    fn context_matches(context: &SecurityContext, m: &niri_config::sandbox_rule::Match) -> bool {
++        if let Some(app_id_re) = &m.app_id {
++            if let Some(context_app_id) = &context.app_id {
++                if !app_id_re.0.is_match(context_app_id) {
++                    return false;
++                }
++            }
++        }
++        true
++    }
++
+ delegate_security_context!(State);
+ 
+ impl IdleNotifierHandler for State {
+diff --git a/src/niri.rs b/src/niri.rs
+index e59de48b..f015a431 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -16,7 +16,7 @@ use calloop::futures::Scheduler;
+ use niri_config::debug::PreviewRender;
+ use niri_config::{
+     Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
+-    WorkspaceReference, Xkb,
++    WorkspaceReference, Xkb, PrivilegedProtocol
+ };
+ use smithay::backend::allocator::Fourcc;
+ use smithay::backend::input::Keycode;
+@@ -2450,8 +2450,25 @@ impl Niri {
+ 
+         let (blocker_cleared_tx, blocker_cleared_rx) = mpsc::channel();
+ 
++
++        fn protocol_is_unrestricted(protocol: PrivilegedProtocol) -> impl Fn(&Client) -> bool {
++            move |client| {
++                let data = client.get_data::<ClientState>().unwrap();
++                if data.restricted {
++                   if let Some(allowed_protocols) = &data.privileged_protocol_allowlist {
++                       debug!("protocol_unrestricted = {:?} for protocol {:?} given allowlist {:?}", allowed_protocols.contains(&protocol), &protocol, allowed_protocols);
++                       return allowed_protocols.contains(&protocol); 
++                   }
++                   debug!("protocol_unrestricted = {:?} for protocol {:?} given allowlist {:?}", false, &protocol, &data.privileged_protocol_allowlist);
++                   return false;
++                }
++                debug!("protocol_unrestricted = {:?} for protocol {:?} given allowlist {:?}", true, &protocol, &data.privileged_protocol_allowlist);
++                true
++            }
++        }
++
+         fn client_is_unrestricted(client: &Client) -> bool {
+-            !client.get_data::<ClientState>().unwrap().restricted
++            !client.get_data::<ClientState>().unwrap().restricted 
+         }
+ 
+         let compositor_state = CompositorState::new_v6::<State>(&display_handle);
+@@ -2479,10 +2496,10 @@ impl Niri {
+         );
+         let layer_shell_state = WlrLayerShellState::new_with_filter::<State, _>(
+             &display_handle,
+-            client_is_unrestricted,
++            protocol_is_unrestricted(PrivilegedProtocol::LayerShell),
+         );
+         let session_lock_state =
+-            SessionLockManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
++            SessionLockManagerState::new::<State, _>(&display_handle, protocol_is_unrestricted(PrivilegedProtocol::SessionLock));
+         let shm_state = ShmState::new::<State>(
+             &display_handle,
+             vec![wl_shm::Format::Xbgr8888, wl_shm::Format::Abgr8888],
+@@ -2510,12 +2527,12 @@ impl Niri {
+         let wlr_data_control_state = WlrDataControlState::new::<State, _>(
+             &display_handle,
+             Some(&primary_selection_state),
+-            client_is_unrestricted,
++            protocol_is_unrestricted(PrivilegedProtocol::WlrDataControl),
+         );
+         let ext_data_control_state = ExtDataControlState::new::<State, _>(
+             &display_handle,
+             Some(&primary_selection_state),
+-            client_is_unrestricted,
++            protocol_is_unrestricted(PrivilegedProtocol::ExtDataControl),
+         );
+         let presentation_state =
+             PresentationState::new::<State>(&display_handle, Monotonic::ID as u32);
+@@ -2524,22 +2541,22 @@ impl Niri {
+ 
+         let text_input_state = TextInputManagerState::new::<State>(&display_handle);
+         let input_method_state =
+-            InputMethodManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
++            InputMethodManagerState::new::<State, _>(&display_handle, protocol_is_unrestricted(PrivilegedProtocol::InputMethod));
+         let keyboard_shortcuts_inhibit_state =
+             KeyboardShortcutsInhibitState::new::<State>(&display_handle);
+         let virtual_keyboard_state =
+-            VirtualKeyboardManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
++            VirtualKeyboardManagerState::new::<State, _>(&display_handle, protocol_is_unrestricted(PrivilegedProtocol::VirtualKeyboard));
+         let virtual_pointer_state =
+-            VirtualPointerManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
++            VirtualPointerManagerState::new::<State, _>(&display_handle, protocol_is_unrestricted(PrivilegedProtocol::VirtualPointer));
+         let foreign_toplevel_state =
+-            ForeignToplevelManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
++            ForeignToplevelManagerState::new::<State, _>(&display_handle, protocol_is_unrestricted(PrivilegedProtocol::ForeignToplevelManagement));
+         let ext_workspace_state =
+-            ExtWorkspaceManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
++            ExtWorkspaceManagerState::new::<State, _>(&display_handle, protocol_is_unrestricted(PrivilegedProtocol::Workspace));
+         let mut output_management_state =
+-            OutputManagementManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
++            OutputManagementManagerState::new::<State, _>(&display_handle, protocol_is_unrestricted(PrivilegedProtocol::OutputManagement));
+         output_management_state.on_config_changed(config_.outputs.clone());
+         let screencopy_state =
+-            ScreencopyManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
++            ScreencopyManagerState::new::<State, _>(&display_handle, protocol_is_unrestricted(PrivilegedProtocol::Screencopy));
+         let viewporter_state = ViewporterState::new::<State>(&display_handle);
+         let xdg_foreign_state = XdgForeignState::new::<State>(&display_handle);
+ 
+@@ -2638,6 +2655,7 @@ impl Niri {
+                         client,
+                         restricted: false,
+                         credentials_unknown: false,
++                        privileged_protocol_allowlist: None,
+                     });
+                 })
+                 .unwrap();
+@@ -2851,6 +2869,7 @@ impl Niri {
+             client,
+             restricted,
+             credentials_unknown,
++            privileged_protocol_allowlist
+         } = client;
+ 
+         let config = self.config.borrow();
+@@ -2860,6 +2879,7 @@ impl Niri {
+             primary_selection_disabled: config.clipboard.disable_primary,
+             restricted,
+             credentials_unknown,
++            privileged_protocol_allowlist,
+         });
+ 
+         if let Err(err) = self.display_handle.insert_client(client, data) {
+@@ -6542,8 +6562,10 @@ pub struct NewClient {
+     pub client: UnixStream,
+     pub restricted: bool,
+     pub credentials_unknown: bool,
++    pub privileged_protocol_allowlist: Option<Vec<PrivilegedProtocol>>
+ }
+ 
++#[derive(Debug)]
+ pub struct ClientState {
+     pub compositor_state: CompositorClientState,
+     pub can_view_decoration_globals: bool,
+@@ -6552,6 +6574,7 @@ pub struct ClientState {
+     pub restricted: bool,
+     /// We cannot retrieve this client's socket credentials.
+     pub credentials_unknown: bool,
++    pub privileged_protocol_allowlist: Option<Vec<PrivilegedProtocol>>,
+ }
+ 
+ impl ClientData for ClientState {
+diff --git a/src/tests/fixture.rs b/src/tests/fixture.rs
+index e57ef215..65cd1b4c 100644
+--- a/src/tests/fixture.rs
++++ b/src/tests/fixture.rs
+@@ -101,6 +101,7 @@ impl Fixture {
+             client: sock1,
+             restricted: false,
+             credentials_unknown: false,
++            privileged_protocol_allowlist: None,
+         });
+ 
+         let client = Client::new(sock2);
+-- 
+2.52.0
+
