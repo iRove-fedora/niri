@@ -3,8 +3,10 @@ This patched version of niri enables us to specify sandbox rules. These rules de
 
 ## Building
 To build, use
-`fedpkg mockbuild`
+`fedpkg -v --release f43 mockbuild | tee mock_output.log`
 to generate the rpm, and then install it with `dnf install path_to_rpm.rpm`
+
+For some reason, the local build is crashing, so use the copr builds for now.
 
 ## Usage
 Example sandbox rule in `config.kdl`: 
